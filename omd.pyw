@@ -76,7 +76,7 @@ PROVIDERS = [
 
 VERSION_RE = re.compile(r"\b(\d+\.\d+\.\d+)\b")
 
-APP_VERSION = "1.7.9"
+APP_VERSION = "1.7.10"
 RELEASES_URL = "https://github.com/khjia/omd/releases"
 
 
@@ -786,6 +786,10 @@ class Session:
         self.preferred_level = None     # thinking level chosen for this tab
         self.name = None                # user-given tab name
         self.auto_thinking = True       # pick effort per message unless overridden
+        self._resume_retried = False
+        self.prompt_history = []        # sent prompts, oldest first
+        self.history_index = None
+        self.history_draft = ""
 
         self.frame = tk.Frame(window.container, bg=BG)
         self._build()
@@ -838,6 +842,10 @@ class Session:
         self.reset_btn.pack(side="right", padx=6)
         self.dir_btn = flat_button(tools_pane, "工作目录", self.choose_dir)
         self.dir_btn.pack(side="right", padx=6)
+        self.undo_btn = flat_button(tools_pane, "撤销", self.undo_last, fg=WARN)
+        self.undo_btn.pack(side="right", padx=6)
+        self.copy_btn = flat_button(tools_pane, "复制", self.copy_last, fg=MUTED)
+        self.copy_btn.pack(side="right", padx=(6, 0))
 
         split.add(model_pane, weight=3)
         split.add(tools_pane, weight=0)
@@ -864,6 +872,8 @@ class Session:
         )
         self.input.bind("<Return>", self._on_return)
         self.input.bind("<Control-Return>", self._on_return)
+        self.input.bind("<Up>", self._on_history_up)
+        self.input.bind("<Down>", self._on_history_down)
 
         send = tk.Button(
             composer,
@@ -948,6 +958,68 @@ class Session:
         self.send()
         return "break"
 
+    def _set_input(self, text):
+        self.input.delete("1.0", "end")
+        self.input.insert("1.0", text)
+        self.input.mark_set("insert", "end-1c")
+
+    def _on_history_up(self, _event):
+        if not self.prompt_history:
+            return None
+        if self.history_index is None:
+            self.history_draft = self.input.get("1.0", "end-1c")
+            self.history_index = len(self.prompt_history) - 1
+        elif self.history_index > 0:
+            self.history_index -= 1
+        self._set_input(self.prompt_history[self.history_index])
+        return "break"
+
+    def _on_history_down(self, _event):
+        if self.history_index is None:
+            return None
+        if self.history_index < len(self.prompt_history) - 1:
+            self.history_index += 1
+            self._set_input(self.prompt_history[self.history_index])
+        else:
+            self.history_index = None
+            self._set_input(self.history_draft)
+        return "break"
+
+    def copy_last(self):
+        if not self.prompt_history:
+            self.transcript.append("\n还没有已发送的任务\n", "meta")
+            return
+        text = self.prompt_history[-1]
+        self.frame.clipboard_clear()
+        self.frame.clipboard_append(text)
+        self.transcript.append(f"\n已复制最后一条任务（{len(text)} 字）\n", "meta")
+
+    def undo_last(self):
+        """Rewind the session past the last user message and put its text back."""
+        if self.busy:
+            self.transcript.append("\n正在运行，先停止再撤销\n", "meta")
+            return
+        if not self.prompt_history:
+            self.transcript.append("\n没有可撤销的任务\n", "meta")
+            return
+        self.undo_pending = True
+        self.request("get_entries")
+
+    def _finish_undo(self, entries):
+        target = None
+        for entry in entries or []:
+            message = entry.get("message") or {}
+            if entry.get("type") == "message" and message.get("role") == "user" and message.get("attribution") != "agent":
+                if text_parts(message.get("content")).strip():
+                    target = entry.get("id")
+        if not target:
+            self.transcript.append("\n找不到可撤销的消息\n", "meta")
+            self.undo_pending = False
+            return
+        self.undo_entry = target
+        self.undo_text = self.prompt_history.pop() if self.prompt_history else ""
+        self.request("navigate_tree", entryId=target)
+
     def send(self):
         text = self.input.get("1.0", "end-1c").strip()
         if text:
@@ -965,6 +1037,9 @@ class Session:
         queued = self.busy
         if queued:
             self.transcript.append("\n(排队，当前回合结束后处理)", "meta")
+        if not self.prompt_history or self.prompt_history[-1] != text:
+            self.prompt_history.append(text)
+        self.history_index = None
         if self.auto_thinking:
             level = pick_thinking_level(text, self.window.thinking_levels)
             self.request("set_thinking_level", level=level)
@@ -1180,6 +1255,12 @@ class Session:
         if t == "_malformed":
             return
         if t == "_backend_exit":
+            if self.resume and not self._resume_retried:
+                self._resume_retried = True
+                tail = "\n".join(list(self.stderr_lines)[-3:])
+                self.transcript.append("\n上次会话无法恢复，已改为新会话\n" + (tail and f"{tail}\n" or ""), "system")
+                self.restart(keep_transcript=True, fresh=True)
+                return
             tail = "\n".join(list(self.stderr_lines)[-8:])
             msg = f"\n[后端已退出 code={f.get('code')}]"
             if tail:
@@ -1196,6 +1277,26 @@ class Session:
         cmd = f.get("command")
         ok = f.get("success")
         data = f.get("data")
+
+        if cmd == "get_entries" and ok:
+            entries = data.get("entries") if isinstance(data, dict) else data
+            self._finish_undo(entries or [])
+            return
+
+        if cmd == "navigate_tree":
+            cancelled = isinstance(data, dict) and data.get("cancelled")
+            if ok and not cancelled:
+                self.history = []
+                self.resume = True
+                self.history_loading = True
+                self.request("get_messages_page", limit=100)
+                if getattr(self, "undo_text", None):
+                    self._set_input(self.undo_text)
+                    self.undo_text = None
+                self.pending_note = "\n已撤销上一条任务，文本已放回输入框\n"
+            self.undo_pending = False
+            self.request("get_state")
+            return
 
         if cmd == "get_messages_page":
             if ok and isinstance(data, dict):
@@ -1352,9 +1453,15 @@ class Session:
         self._render_history(self.history)
         self.history = []
         self.set_status("就绪")
+        note = getattr(self, "pending_note", None)
+        if note:
+            self.pending_note = None
+            self.transcript.append(note, "meta")
         self.request("get_state")
 
     def _render_history(self, messages):
+        self.prompt_history = []
+        self.history_index = None
         self.transcript.clear()
         if not messages:
             self.transcript.append("omd · 新会话，输入消息开始\n", "meta")
@@ -1371,6 +1478,8 @@ class Session:
                     continue
                 self.transcript.add_block(key, "你", "name_user")
                 self.transcript.set_block(key, [(body, "body")])
+                if not self.prompt_history or self.prompt_history[-1] != body.strip():
+                    self.prompt_history.append(body.strip())
             elif role == "assistant":
                 segments = self._segments_for(message)
                 if not segments:
