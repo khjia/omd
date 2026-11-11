@@ -46,6 +46,15 @@ UI_FONT = ("Microsoft YaHei UI", 10)
 UI_FONT_SM = ("Microsoft YaHei UI", 9)
 MONO_FONT = ("Cascadia Mono", 9)
 
+DEFAULT_FONT_SIZE = 11
+FONT_MIN, FONT_MAX = 9, 20
+
+
+def ui_font(size, bold=False, italic=False, mono=False):
+    family = MONO_FONT[0] if mono else UI_FONT[0]
+    style = "bold" if bold else ("italic" if italic else "")
+    return (family, size, style) if style else (family, size)
+
 CREATE_NO_WINDOW = 0x08000000
 
 APP_DIR = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"), "omd")
@@ -76,7 +85,7 @@ PROVIDERS = [
 
 VERSION_RE = re.compile(r"\b(\d+\.\d+\.\d+)\b")
 
-APP_VERSION = "1.7.10"
+APP_VERSION = "1.8.0"
 RELEASES_URL = "https://github.com/khjia/omd/releases"
 
 
@@ -85,6 +94,32 @@ def semver(text):
         return tuple(int(part) for part in text.split("."))
     except (AttributeError, ValueError):
         return (0, 0, 0)
+
+
+def load_pref(key, default=None):
+    try:
+        with open(STATE_FILE, encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data.get(key, default)
+    except (OSError, ValueError):
+        return default
+
+
+def save_pref(key, value):
+    try:
+        with open(STATE_FILE, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    data[key] = value
+    try:
+        os.makedirs(APP_DIR, exist_ok=True)
+        with open(STATE_FILE, "w", encoding="utf-8") as fh:
+            json.dump(data, fh)
+    except OSError:
+        pass
 
 
 def load_keys():
@@ -685,6 +720,28 @@ class Transcript:
         t.mark_unset("btmp")
         self._pin(pinned)
 
+    def apply_font(self, size):
+        self.text.configure(font=ui_font(size))
+        for name, kwargs in (
+            ("name_user", dict(size=size - 1, bold=True)),
+            ("name_assistant", dict(size=size - 1, bold=True)),
+            ("body", dict(size=size)),
+            ("thinking", dict(size=size - 1, italic=True)),
+            ("tool", dict(size=size - 1, mono=True)),
+            ("tool_err", dict(size=size - 1, mono=True)),
+            ("meta", dict(size=size - 1)),
+            ("error", dict(size=size - 1)),
+            ("system", dict(size=size - 1)),
+        ):
+            self.text.tag_configure(name, font=ui_font(**kwargs))
+
+    def tag_block(self, key, tag):
+        try:
+            self.text.tag_add(tag, f"b_{key}_s", f"b_{key}_e")
+            return True
+        except tk.TclError:
+            return False
+
     def append(self, text, tag):
         pinned = self.at_bottom()
         self.text.insert("end", text, tag)
@@ -787,6 +844,8 @@ class Session:
         self.name = None                # user-given tab name
         self.auto_thinking = True       # pick effort per message unless overridden
         self._resume_retried = False
+        self.message_actions = {}
+        self.undo_target_text = None
         self.prompt_history = []        # sent prompts, oldest first
         self.history_index = None
         self.history_draft = ""
@@ -835,17 +894,12 @@ class Session:
             highlightthickness=0,
         ).pack(side="left")
 
-        self.abort_btn = flat_button(tools_pane, "停止", self.abort, fg=ERR)
-        self.abort_btn.pack(side="right", padx=(6, 0))
-        self.abort_btn.configure(state="disabled", disabledforeground=MUTED)
+
         self.reset_btn = flat_button(tools_pane, "重置会话", self.new_session)
         self.reset_btn.pack(side="right", padx=6)
         self.dir_btn = flat_button(tools_pane, "工作目录", self.choose_dir)
         self.dir_btn.pack(side="right", padx=6)
-        self.undo_btn = flat_button(tools_pane, "撤销", self.undo_last, fg=WARN)
-        self.undo_btn.pack(side="right", padx=6)
-        self.copy_btn = flat_button(tools_pane, "复制", self.copy_last, fg=MUTED)
-        self.copy_btn.pack(side="right", padx=(6, 0))
+
 
         split.add(model_pane, weight=3)
         split.add(tools_pane, weight=0)
@@ -874,8 +928,9 @@ class Session:
         self.input.bind("<Control-Return>", self._on_return)
         self.input.bind("<Up>", self._on_history_up)
         self.input.bind("<Down>", self._on_history_down)
+        self.input.bind("<KeyRelease>", lambda _e: self._refresh_send_button())
 
-        send = tk.Button(
+        self.send_btn = tk.Button(
             composer,
             text="发送  ⏎",
             command=self.send,
@@ -890,6 +945,7 @@ class Session:
             pady=4,
             cursor="hand2",
         )
+        send = self.send_btn
         # fixed controls claim their space first; the stretches shrink instead
         send.pack(side="right", padx=(10, 0), ipady=10, ipadx=8)
         self.input.pack(side="left", fill="both", expand=True)
@@ -985,6 +1041,50 @@ class Session:
             self._set_input(self.history_draft)
         return "break"
 
+    def apply_font(self, size):
+        self.transcript.apply_font(size)
+        self.input.configure(font=ui_font(size))
+        if hasattr(self, "activity"):
+            self.activity.configure(font=ui_font(max(size - 1, 8)))
+        if hasattr(self, "send_btn"):
+            self.send_btn.configure(font=ui_font(size, bold=True))
+
+    def _bind_message(self, key, text):
+        tag = f"msg_{key}"
+        if not self.transcript.tag_block(key, tag):
+            return
+        self.message_actions[tag] = text
+
+        def on_click(event, body=text):
+            menu = tk.Menu(
+                self.frame, tearoff=0, bg=SURFACE, fg=FG,
+                activebackground=SURFACE_HI, activeforeground=FG,
+                bd=0, font=UI_FONT_SM,
+            )
+            menu.add_command(label="复制这条", command=lambda: self._copy_text(body))
+            menu.add_command(label="撤销到这条之前", command=lambda: self._undo_to(body))
+            try:
+                menu.tk_popup(event.x_root, event.y_root)
+            finally:
+                menu.grab_release()
+            return "break"
+
+        self.transcript.text.tag_bind(tag, "<Button-1>", on_click)
+        self.transcript.text.tag_bind(tag, "<Enter>", lambda _e: self.transcript.text.configure(cursor="hand2"))
+        self.transcript.text.tag_bind(tag, "<Leave>", lambda _e: self.transcript.text.configure(cursor="arrow"))
+
+    def _copy_text(self, text):
+        self.frame.clipboard_clear()
+        self.frame.clipboard_append(text)
+        self.transcript.append(f"\n已复制（{len(text)} 字）\n", "meta")
+
+    def _undo_to(self, text):
+        if self.busy:
+            self.transcript.append("\n正在运行，先停止再撤销\n", "meta")
+            return
+        self.undo_target_text = text
+        self.request("get_entries")
+
     def copy_last(self):
         if not self.prompt_history:
             self.transcript.append("\n还没有已发送的任务\n", "meta")
@@ -995,29 +1095,35 @@ class Session:
         self.transcript.append(f"\n已复制最后一条任务（{len(text)} 字）\n", "meta")
 
     def undo_last(self):
-        """Rewind the session past the last user message and put its text back."""
-        if self.busy:
-            self.transcript.append("\n正在运行，先停止再撤销\n", "meta")
-            return
         if not self.prompt_history:
             self.transcript.append("\n没有可撤销的任务\n", "meta")
             return
-        self.undo_pending = True
-        self.request("get_entries")
+        self._undo_to(self.prompt_history[-1])
 
     def _finish_undo(self, entries):
-        target = None
+        wanted = getattr(self, "undo_target_text", None)
+        self.undo_target_text = None
+        last_user = None
+        matched = None
         for entry in entries or []:
             message = entry.get("message") or {}
-            if entry.get("type") == "message" and message.get("role") == "user" and message.get("attribution") != "agent":
-                if text_parts(message.get("content")).strip():
-                    target = entry.get("id")
+            if entry.get("type") != "message" or message.get("role") != "user":
+                continue
+            if message.get("attribution") == "agent":
+                continue
+            body = text_parts(message.get("content")).strip()
+            if not body:
+                continue
+            last_user = entry.get("id")
+            if wanted is not None and body == wanted.strip():
+                matched = entry.get("id")
+        target = matched or (last_user if wanted is None else None)
         if not target:
             self.transcript.append("\n找不到可撤销的消息\n", "meta")
-            self.undo_pending = False
             return
-        self.undo_entry = target
-        self.undo_text = self.prompt_history.pop() if self.prompt_history else ""
+        self.undo_text = wanted or (self.prompt_history[-1] if self.prompt_history else "")
+        if self.prompt_history and self.prompt_history[-1] == self.undo_text:
+            self.prompt_history.pop()
         self.request("navigate_tree", entryId=target)
 
     def send(self):
@@ -1032,8 +1138,10 @@ class Session:
         if not text:
             return
         self.seq += 1
-        self.transcript.add_block(f"u{self.seq}", "你", "name_user")
-        self.transcript.set_block(f"u{self.seq}", [(text, "body")])
+        key = f"u{self.seq}"
+        self.transcript.add_block(key, "你", "name_user")
+        self.transcript.set_block(key, [(text, "body")])
+        self._bind_message(key, text)
         queued = self.busy
         if queued:
             self.transcript.append("\n(排队，当前回合结束后处理)", "meta")
@@ -1048,6 +1156,7 @@ class Session:
         if queued:
             fields["streamingBehavior"] = "followUp"
         self.request("prompt", **fields)
+        self._refresh_send_button()
         if not queued:
             self.set_busy(True)
             if not (self.auto_thinking and self.phase.startswith("思考 ")):
@@ -1359,8 +1468,8 @@ class Session:
             self.current_pair = (model["provider"], model["id"])
         if not self.name and data.get("sessionName"):
             self.name = str(data["sessionName"])
-        if data.get("isStreaming") and not self.busy:
-            self.set_busy(True)
+        # busy follows the run lifecycle (agent_start / prompt_result / session_settled);
+        # get_state's isStreaming lags and used to flip the button the wrong way
         parts = []
         ctx = data.get("contextUsage") or {}
         if ctx:
@@ -1385,6 +1494,13 @@ class Session:
         self.set_status("  ·  ".join(parts))
         self.window.refresh_session_chrome(self)
 
+    def _refresh_send_button(self):
+        has_text = bool(self.input.get("1.0", "end-1c").strip())
+        if self.busy and not has_text:
+            self.send_btn.configure(text="停止  ■", command=self.abort, bg=ERR, activebackground=ERR)
+        else:
+            self.send_btn.configure(text="发送  ⏎", command=self.send, bg=ACCENT, activebackground=ACCENT)
+
     def set_busy(self, flag):
         was_busy = self.busy
         self.busy = bool(flag)
@@ -1400,8 +1516,8 @@ class Session:
             self.phase = ""
             self._tick_running = False
             self.activity.configure(text="")
-        if hasattr(self, "abort_btn"):
-            self.abort_btn.configure(state="normal" if self.busy else "disabled")
+        if hasattr(self, "send_btn"):
+            self._refresh_send_button()
         self.window.refresh_session_chrome(self)
 
     def set_phase(self, text):
@@ -1478,6 +1594,7 @@ class Session:
                     continue
                 self.transcript.add_block(key, "你", "name_user")
                 self.transcript.set_block(key, [(body, "body")])
+                self._bind_message(key, body.strip())
                 if not self.prompt_history or self.prompt_history[-1] != body.strip():
                     self.prompt_history.append(body.strip())
             elif role == "assistant":
@@ -1788,6 +1905,10 @@ class Window:
         self.active = None
         self.model_map = {}
         self.show_thinking = tk.BooleanVar(value=True)
+        try:
+            self.font_size = max(FONT_MIN, min(FONT_MAX, int(load_pref("font_size", DEFAULT_FONT_SIZE))))
+        except (TypeError, ValueError):
+            self.font_size = DEFAULT_FONT_SIZE
         self.thinking_levels = []
         self._last_update_state = None
         self._banner_sig = None
@@ -1865,6 +1986,10 @@ class Window:
             side="left", padx=(16, 10)
         )
 
+        self.font_minus = flat_button(header, "A−", lambda: self.change_font(-1), fg=MUTED)
+        self.font_minus.pack(side="right", padx=(6, 0))
+        self.font_plus = flat_button(header, "A+", lambda: self.change_font(1), fg=MUTED)
+        self.font_plus.pack(side="right", padx=(6, 4))
         self.update_btn = flat_button(header, "更新", Updater.check_now, fg=MUTED)
         self.update_btn.pack(side="right", padx=(6, 14))
         self.settings_btn = flat_button(header, "设置", self.open_settings, fg=MUTED)
@@ -1942,6 +2067,7 @@ class Window:
             session.preferred_pair = self.active.preferred_pair or self.active.current_pair
             session.preferred_level = self.active.preferred_level
         self.sessions.append(session)
+        session.apply_font(self.font_size)
         chip = self._make_chip(session)
         self.tab_chips[session] = chip
         self.switch_to(session)
@@ -2042,6 +2168,12 @@ class Window:
             session.restart(keep_transcript=True)
         if self.active:
             self.active.transcript.append("\n已应用 API 密钥配置（新会话生效）\n", "meta")
+
+    def change_font(self, delta):
+        self.font_size = max(FONT_MIN, min(FONT_MAX, self.font_size + delta))
+        for session in self.sessions:
+            session.apply_font(self.font_size)
+        save_pref("font_size", self.font_size)
 
     def open_settings(self):
         SettingsDialog(self)
