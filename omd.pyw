@@ -72,7 +72,7 @@ PROVIDERS = [
 
 VERSION_RE = re.compile(r"\b(\d+\.\d+\.\d+)\b")
 
-APP_VERSION = "1.7.1"
+APP_VERSION = "1.7.3"
 RELEASES_URL = "https://github.com/khjia/omd/releases"
 
 
@@ -756,18 +756,23 @@ class Session:
         bar = tk.Frame(self.frame, bg=SURFACE, padx=12, pady=6)
         bar.pack(fill="x", side="top")
 
-        self.model_box = ttk.Combobox(bar, width=34, state="readonly")
-        self.model_box.pack(side="left", padx=(0, 6))
+        split = ttk.PanedWindow(bar, orient="horizontal")
+        split.pack(fill="x", side="left", expand=True)
+        model_pane = tk.Frame(split, bg=SURFACE)
+        tools_pane = tk.Frame(split, bg=SURFACE)
+
+        self.model_box = ttk.Combobox(model_pane, width=34, state="readonly")
+        self.model_box.pack(side="left", fill="x", expand=True, padx=(0, 6))
         self.model_box.bind("<<ComboboxSelected>>", self._on_model_selected)
         self.model_box.set("模型加载中…")
 
-        self.thinking_box = ttk.Combobox(bar, width=8, state="readonly")
+        self.thinking_box = ttk.Combobox(tools_pane, width=8, state="readonly")
         self.thinking_box.pack(side="left", padx=(0, 10))
         self.thinking_box.bind("<<ComboboxSelected>>", self._on_thinking_selected)
         self.thinking_box.set("思考")
 
         tk.Checkbutton(
-            bar,
+            tools_pane,
             text="显示思考",
             variable=self.window.show_thinking,
             command=self.redraw,
@@ -775,19 +780,22 @@ class Session:
             fg=MUTED,
             activebackground=SURFACE,
             activeforeground=FG,
-            selectcolor=SURFACE_HI,
+            selectcolor=FG,
             font=UI_FONT_SM,
             borderwidth=0,
             highlightthickness=0,
         ).pack(side="left")
 
-        self.abort_btn = flat_button(bar, "中止", self.abort, fg=ERR)
+        self.abort_btn = flat_button(tools_pane, "停止", self.abort, fg=ERR)
         self.abort_btn.pack(side="right", padx=(6, 0))
         self.abort_btn.configure(state="disabled", disabledforeground=MUTED)
-        self.reset_btn = flat_button(bar, "重置会话", self.new_session)
+        self.reset_btn = flat_button(tools_pane, "重置会话", self.new_session)
         self.reset_btn.pack(side="right", padx=6)
-        self.dir_btn = flat_button(bar, "工作目录", self.choose_dir)
+        self.dir_btn = flat_button(tools_pane, "工作目录", self.choose_dir)
         self.dir_btn.pack(side="right", padx=6)
+
+        split.add(model_pane, weight=3)
+        split.add(tools_pane, weight=0)
 
         self.transcript = Transcript(self.frame)
 
@@ -916,6 +924,9 @@ class Session:
         if queued:
             fields["streamingBehavior"] = "followUp"
         self.request("prompt", **fields)
+        if not queued:
+            self.set_busy(True)
+            self.set_phase("等待模型…")
 
     def abort(self):
         self.request("abort")
@@ -1186,7 +1197,8 @@ class Session:
             self.current_pair = (model["provider"], model["id"])
         if not self.name and data.get("sessionName"):
             self.name = str(data["sessionName"])
-        self.set_busy(data.get("isStreaming"))
+        if data.get("isStreaming") and not self.busy:
+            self.set_busy(True)
         parts = []
         ctx = data.get("contextUsage") or {}
         if ctx:
@@ -1457,8 +1469,6 @@ OPENCODE_ENV = {
     "moonshot": "MOONSHOT_API_KEY",
     "kimi": "MOONSHOT_API_KEY",
     "minimax": "MINIMAX_API_KEY",
-    "minimax-cn": "MINIMAX_API_KEY",
-    "minimax-cn-coding-plan": "MINIMAX_API_KEY",
     "groq": "GROQ_API_KEY",
     "mistral": "MISTRAL_API_KEY",
     "cerebras": "CEREBRAS_API_KEY",
@@ -1554,9 +1564,25 @@ def detect_bridges():
     for provider, entry in (opencode or {}).items():
         if not isinstance(entry, dict) or entry.get("type") != "api":
             continue
-        key = entry.get("key")
-        env_name = OPENCODE_ENV.get(str(provider).lower())
-        if not key or not env_name:
+        key = str(entry.get("key") or "").strip()
+        provider_id = str(provider).lower()
+        env_name = OPENCODE_ENV.get(provider_id)
+        if not key:
+            continue
+        if not env_name and ("coding-plan" in provider_id or provider_id.endswith("-cn")):
+            found.append({
+                "id": f"opencode-{provider}-unsupported",
+                "source": f"OpenCode · {provider}",
+                "kind": "订阅密钥",
+                "path": opencode_path,
+                "detail": mask_secret(key),
+                "note": "该密钥只对 MiniMax CN/订阅端点有效，omp 内置 minimax 走国际站，暂不支持自动桥接",
+                "env": {},
+                "already": False,
+                "unsupported": True,
+            })
+            continue
+        if not env_name:
             continue
         add({
             "id": f"opencode-{provider}",
@@ -1678,7 +1704,7 @@ class BridgeDialog(tk.Toplevel):
             self.vars[item["id"]] = var
             unsupported = item.get("unsupported")
             check = tk.Checkbutton(
-                row, variable=var, bg=BG, activebackground=BG, selectcolor=SURFACE_HI,
+                row, variable=var, bg=BG, activebackground=BG, selectcolor=FG,
                 borderwidth=0, highlightthickness=0,
             )
             check.pack(side="left")
@@ -1830,7 +1856,7 @@ class SettingsDialog(tk.Toplevel):
         tk.Checkbutton(
             foot, text="显示明文", variable=self.reveal, command=self._toggle_reveal,
             bg=SURFACE, fg=MUTED, activebackground=SURFACE, activeforeground=FG,
-            selectcolor=SURFACE_HI, font=UI_FONT_SM, borderwidth=0, highlightthickness=0,
+            selectcolor=FG, font=UI_FONT_SM, borderwidth=0, highlightthickness=0,
         ).pack(side="left", padx=(12, 0))
 
         self.bind("<Escape>", lambda _e: self.destroy())
