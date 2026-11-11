@@ -2,6 +2,13 @@
 
 Windows 上的 `omp` 图形前端。单窗口多会话标签，每个标签一个独立的 `omp --mode rpc` 后端进程，可各选各的模型。
 
+## 下载
+
+最新安装包见 [Releases](https://github.com/khjia/omd/releases/latest)：
+
+- `omd-setup-x.y.z.exe` —— 安装包（内置 omp CLI，免管理员）
+- `omd.exe` —— 绿色版，双击即用
+
 ## 功能
 
 - **多会话标签**：`Ctrl+N` 新建、`Ctrl+W` 关闭、`Ctrl+Tab` 切换；双击标签可重命名（名字写进 omp 会话）。
