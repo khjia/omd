@@ -1637,48 +1637,6 @@ class BridgeDialog(tk.Toplevel):
 
 
 
-class RenameDialog(tk.Toplevel):
-    """Small modal to name a tab (persisted as the omp session name)."""
-
-    def __init__(self, window, session):
-        super().__init__(window.root, bg=BG)
-        self.window = window
-        self.session = session
-        self.title("重命名会话")
-        self.geometry("380x150")
-        self.resizable(False, False)
-        self.transient(window.root)
-        self.grab_set()
-
-        tk.Label(self, text="会话名称", bg=BG, fg=MUTED, font=UI_FONT_SM).pack(anchor="w", padx=18, pady=(16, 4))
-        self.entry = tk.Entry(
-            self, bg=SURFACE_HI, fg=FG, insertbackground=FG, relief="flat", font=UI_FONT,
-            highlightthickness=1, highlightbackground=BORDER, highlightcolor=ACCENT,
-        )
-        self.entry.pack(fill="x", padx=18, ipady=6)
-        self.entry.insert(0, session.name or session.display_name())
-        self.entry.select_range(0, "end")
-        self.entry.focus_set()
-        self.entry.bind("<Return>", lambda _e: self.save())
-        self.bind("<Escape>", lambda _e: self.destroy())
-
-        row = tk.Frame(self, bg=BG)
-        row.pack(fill="x", padx=18, pady=12)
-        tk.Button(
-            row, text="取消", command=self.destroy, bg=SURFACE_HI, fg=FG,
-            activebackground=BORDER, activeforeground=FG, relief="flat", borderwidth=0,
-            font=UI_FONT_SM, padx=12, pady=4, cursor="hand2",
-        ).pack(side="right")
-        tk.Button(
-            row, text="重命名", command=self.save, bg=ACCENT, fg="#12131a",
-            activebackground=ACCENT, activeforeground="#12131a", relief="flat", borderwidth=0,
-            font=UI_FONT_SM, padx=14, pady=4, cursor="hand2",
-        ).pack(side="right", padx=(0, 8))
-
-    def save(self):
-        self.session.rename(self.entry.get())
-        self.destroy()
-
 # ------------------------------------------------------------------ settings --
 
 
@@ -2136,7 +2094,59 @@ class Window:
         self.status.configure(text=session.status_text)
 
     def rename_session(self, session):
-        RenameDialog(self, session)
+        """Inline rename: the tab chip turns into an entry, no dialog."""
+        chip = self.tab_chips.get(session)
+        if not chip or getattr(chip, "editing", False):
+            return
+        self.switch_to(session)
+        chip.editing = True
+        original = session.name or session.display_name()
+        chip.label_widget.pack_forget()
+        entry = tk.Entry(
+            chip,
+            bg=SURFACE_HI,
+            fg=FG,
+            insertbackground=FG,
+            relief="flat",
+            borderwidth=0,
+            font=UI_FONT_SM,
+            width=max(8, min(28, len(original) + 2)),
+            highlightthickness=1,
+            highlightbackground=ACCENT,
+            highlightcolor=ACCENT,
+        )
+        entry.pack(side="left", fill="x", padx=(0, 2), before=chip.close_widget)
+        entry.insert(0, original)
+        entry.select_range(0, "end")
+        entry.after(30, entry.focus_set)
+        chip.entry = entry
+
+        def finish(commit):
+            if not chip.editing:
+                return
+            chip.editing = False
+            value = entry.get()
+            entry.destroy()
+            chip.label_widget.pack(side="left", before=chip.close_widget)
+            try:
+                self.root.unbind("<Button-1>", click_id)
+            except tk.TclError:
+                pass
+            if commit:
+                session.rename(value)
+            else:
+                self._style_chips()
+            session.input.focus_set()
+
+        def on_click(event):
+            if event.widget is entry:
+                return
+            finish(True)
+
+        entry.bind("<Return>", lambda _e: finish(True))
+        entry.bind("<Escape>", lambda _e: finish(False))
+        # commit only on a click elsewhere in the app; losing OS focus keeps editing
+        click_id = self.root.bind("<Button-1>", on_click, add="+")
 
     # -- update banner ------------------------------------------------------
 
