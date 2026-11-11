@@ -1,0 +1,15 @@
+# build outputs
+dist/
+build/
+*.spec
+.venv-build/
+__pycache__/
+*.pyc
+
+# signing material (private keys never belong in a repo)
+certs/
+
+# local state / logs
+*.log
+state.json
+keys.json
