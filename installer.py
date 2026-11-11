@@ -22,7 +22,7 @@ import winreg
 
 APP_NAME = "omd"
 APP_ID = "omd"
-VERSION = "1.4.1"
+VERSION = "1.7.0"
 EXE_NAME = "omd.exe"
 OMP_EXE = "omp.exe"
 UNINST_LOCATION = rf"Software\Microsoft\Windows\CurrentVersion\Uninstall\{APP_ID}"

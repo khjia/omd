@@ -72,6 +72,9 @@ PROVIDERS = [
 
 VERSION_RE = re.compile(r"\b(\d+\.\d+\.\d+)\b")
 
+APP_VERSION = "1.7.0"
+RELEASES_URL = "https://github.com/khjia/omd/releases"
+
 
 def semver(text):
     try:
@@ -347,6 +350,102 @@ class Updater:
     def _publish(cls, state):
         with cls._lock:
             cls._state = dict(state)
+
+
+
+
+class SelfUpdater:
+    """Checks the omd GitHub release feed; no API token, no rate-limit budget."""
+
+    INTERVAL = 24 * 3600
+    _lock = threading.Lock()
+    _state = None
+    _started = False
+
+    @classmethod
+    def _load(cls):
+        try:
+            with open(STATE_FILE, encoding="utf-8") as fh:
+                data = json.load(fh)
+            return data if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    @classmethod
+    def _save(cls, updates):
+        data = cls._load()
+        data.update(updates)
+        os.makedirs(APP_DIR, exist_ok=True)
+        try:
+            with open(STATE_FILE, "w", encoding="utf-8") as fh:
+                json.dump(data, fh)
+        except OSError:
+            pass
+
+    @classmethod
+    def snapshot(cls):
+        with cls._lock:
+            return dict(cls._state) if cls._state else None
+
+    @classmethod
+    def dismissed(cls):
+        return cls._load().get("omd_dismissed") or ""
+
+    @classmethod
+    def dismiss(cls, version):
+        cls._save({"omd_dismissed": version or "", "omd_checked_at": time.time()})
+        with cls._lock:
+            if cls._state:
+                cls._state = dict(cls._state)
+                cls._state["newer"] = False
+
+    @classmethod
+    def check(cls, force=False):
+        with cls._lock:
+            if cls._started and not force:
+                return
+            cls._started = True
+        threading.Thread(target=cls._worker, args=(force,), daemon=True).start()
+
+    @classmethod
+    def _worker(cls, force):
+        persisted = cls._load()
+        if not force and time.time() - float(persisted.get("omd_checked_at") or 0) < cls.INTERVAL:
+            latest = persisted.get("omd_latest")
+            if latest:
+                cls._publish(latest, RELEASES_URL + "/tag/v" + latest)
+            return
+        time.sleep(random.uniform(2, 15))
+        import urllib.request
+
+        request = urllib.request.Request(
+            RELEASES_URL + "/latest",
+            method="HEAD",
+            headers={"User-Agent": f"omd/{APP_VERSION}"},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=12) as response:
+                final_url = response.url
+        except Exception as exc:  # offline, blocked, rate limited: stay quiet
+            with cls._lock:
+                cls._state = {"error": str(exc)}
+            return
+        match = VERSION_RE.search(final_url.rsplit("/", 1)[-1])
+        if not match:
+            return
+        latest = match.group(1)
+        cls._publish(latest, final_url)
+        cls._save({"omd_latest": latest, "omd_checked_at": time.time()})
+
+    @classmethod
+    def _publish(cls, latest, url):
+        with cls._lock:
+            cls._state = {
+                "current": APP_VERSION,
+                "latest": latest,
+                "newer": semver(latest) > semver(APP_VERSION),
+                "url": url,
+            }
 
 
 # ------------------------------------------------------------------ backend --
@@ -1779,6 +1878,7 @@ class Window:
 
         self._build()
         Updater.auto_check()
+        SelfUpdater.check()
         root.after(self.POLL_MS, self._poll)
         root.after(800, self._ensure_backend_available)
 
@@ -1882,6 +1982,9 @@ class Window:
         tk.Label(status, text="Enter 发送 · Ctrl+N 新会话 · Ctrl+W 关闭 · 双击标签重命名", bg=BG, fg=BORDER, font=UI_FONT_SM).pack(
             side="right", padx=8
         )
+        tk.Label(
+            status, text=f"omd {APP_VERSION}", bg=BG, fg=BORDER, font=UI_FONT_SM, anchor="w"
+        ).pack(side="left", padx=(0, 10))
         self.version_label = tk.Label(status, text="", bg=BG, fg=BORDER, font=UI_FONT_SM, anchor="w")
         self.version_label.pack(side="left", padx=(0, 0))
 
@@ -2180,6 +2283,11 @@ class Window:
     def _install_update(self):
         Updater.start_install()
 
+    def _dismiss_self_update(self):
+        own = SelfUpdater.snapshot() or {}
+        SelfUpdater.dismiss(own.get("latest") or "")
+        self._hide_banner()
+
     def _dismiss_update(self):
         state = Updater.snapshot() or {}
         Updater.dismiss(state.get("latest") or "")
@@ -2191,6 +2299,17 @@ class Window:
             self.active.restart()
 
     def _sync_update_banner(self):
+        own = SelfUpdater.snapshot()
+        if own and own.get("newer") and own.get("latest") != SelfUpdater.dismissed():
+            self._show_banner(
+                f"omd 有新版本 {own['latest']}（当前 {APP_VERSION}）",
+                [
+                    ("打开发布页", lambda: webbrowser.open(own.get("url") or RELEASES_URL)),
+                    ("忽略此版本", self._dismiss_self_update),
+                ],
+            )
+            return
+
         state = Updater.snapshot()
         if state is None or state == self._last_update_state:
             return
