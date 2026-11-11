@@ -67,12 +67,16 @@ PROVIDERS = [
     ("MiniMax", "MINIMAX_API_KEY", "https://platform.minimaxi.com/user-center/basic-information/interface-key"),
     ("Cerebras", "CEREBRAS_API_KEY", "https://cloud.cerebras.ai/"),
     ("SiliconFlow", "SILICONFLOW_API_KEY", "https://cloud.siliconflow.cn/account/ak"),
-    ("OpenCode Zen", "OPENCODE_API_KEY", "https://opencode.ai/auth"),
+    ("OpenCode Zen / Go", "OPENCODE_API_KEY", "https://opencode.ai/auth"),
+    ("阿里云百炼 Qwen", "ALIBABA_CODING_PLAN_API_KEY", "https://bailian.console.aliyun.com/"),
+    ("DeepInfra", "DEEPINFRA_API_KEY", "https://deepinfra.com/dash/api_keys"),
+    ("StepFun", "STEPFUN_API_KEY", "https://platform.stepfun.com/interface-key"),
+    ("Kilo", "KILO_API_KEY", "https://kilocode.ai/"),
 ]
 
 VERSION_RE = re.compile(r"\b(\d+\.\d+\.\d+)\b")
 
-APP_VERSION = "1.7.7"
+APP_VERSION = "1.7.8"
 RELEASES_URL = "https://github.com/khjia/omd/releases"
 
 
@@ -1520,6 +1524,21 @@ class SettingsDialog(tk.Toplevel):
         self.transient(window.root)
         self.grab_set()
         self._build()
+        # wheel over any child widget (entries, labels) still scrolls the list
+        self.bind_all("<MouseWheel>", self._on_wheel, add="+")
+
+    def _on_wheel(self, event):
+        canvas = getattr(self, "canvas", None)
+        if canvas is not None:
+            canvas.yview_scroll(int(-event.delta / 120), "units")
+            return "break"
+
+    def destroy(self):
+        try:
+            self.unbind_all("<MouseWheel>")
+        except tk.TclError:
+            pass
+        super().destroy()
 
     def _build(self):
         head = tk.Frame(self, bg=BG, padx=18, pady=14)
@@ -1538,6 +1557,7 @@ class SettingsDialog(tk.Toplevel):
         body = tk.Frame(self, bg=BG)
         body.pack(fill="both", expand=True, padx=18, pady=(4, 0))
         canvas = tk.Canvas(body, bg=BG, highlightthickness=0)
+        self.canvas = canvas
         scroll = ttk.Scrollbar(body, orient="vertical", command=canvas.yview)
         inner = tk.Frame(canvas, bg=BG)
         window_id = canvas.create_window((0, 0), window=inner, anchor="nw")
