@@ -72,7 +72,7 @@ PROVIDERS = [
 
 VERSION_RE = re.compile(r"\b(\d+\.\d+\.\d+)\b")
 
-APP_VERSION = "1.7.3"
+APP_VERSION = "1.7.4"
 RELEASES_URL = "https://github.com/khjia/omd/releases"
 
 
@@ -137,6 +137,41 @@ def flat_button(parent, text, command, fg=FG, accent=False):
         pady=4,
         cursor="hand2",
     )
+
+
+def pick_thinking_level(text, available):
+    """Rough effort estimate so simple prompts stay cheap and hard ones think longer."""
+    lowered = (text or "").lower()
+    hard_markers = (
+        "重构", "调试", "架构", "设计", "分析", "为什么", "报错", "异常", "性能", "优化",
+        "算法", "推导", "证明", "排查", "定位", "迁移", "兼容", "并发", "死锁",
+        "refactor", "debug", "architect", "design", "analy", "profil", "test", "bug",
+    )
+    score = 0
+    if len(lowered) > 120:
+        score += 1
+    if len(lowered) > 400:
+        score += 1
+    if "```" in lowered:
+        score += 1
+    if any(marker in lowered for marker in hard_markers):
+        score += 2
+    if lowered.count("?") + lowered.count("？") >= 2:
+        score += 1
+    order = ["off", "minimal", "low", "medium", "high", "xhigh", "max"]
+    if score >= 4:
+        wanted = "max"
+    elif score >= 2:
+        wanted = "high"
+    else:
+        wanted = "low"
+    levels = [lv for lv in (available or []) if lv in order]
+    if not levels:
+        return wanted
+    if wanted in levels:
+        return wanted
+    target = order.index(wanted)
+    return min(levels, key=lambda lv: abs(order.index(lv) - target))
 
 
 def resource_path(name):
@@ -741,6 +776,7 @@ class Session:
         self.current_pair = None
         self.preferred_level = None     # thinking level chosen for this tab
         self.name = None                # user-given tab name
+        self.auto_thinking = True       # pick effort per message unless overridden
 
         self.frame = tk.Frame(window.container, bg=BG)
         self._build()
@@ -920,13 +956,18 @@ class Session:
         queued = self.busy
         if queued:
             self.transcript.append("\n(排队，当前回合结束后处理)", "meta")
+        if self.auto_thinking:
+            level = pick_thinking_level(text, self.window.thinking_levels)
+            self.request("set_thinking_level", level=level)
+            self.set_phase(f"思考 {level}")
         fields = {"message": text}
         if queued:
             fields["streamingBehavior"] = "followUp"
         self.request("prompt", **fields)
         if not queued:
             self.set_busy(True)
-            self.set_phase("等待模型…")
+            if not (self.auto_thinking and self.phase.startswith("思考 ")):
+                self.set_phase("等待模型…")
 
     def abort(self):
         self.request("abort")
@@ -949,12 +990,17 @@ class Session:
         label = self.window._label_for(self)
         if label:
             self.model_box.set(label)
-        levels = self.window.thinking_levels
+        levels = list(self.window.thinking_levels)
+        if levels and "自动" not in levels:
+            levels = ["自动"] + levels
         if levels:
             self.thinking_box.configure(values=levels)
-        level = self.preferred_level or self.state.get("thinkingLevel")
-        if level:
-            self.thinking_box.set(str(level))
+        if self.auto_thinking:
+            self.thinking_box.set("自动")
+        else:
+            level = self.preferred_level or self.state.get("thinkingLevel")
+            if level:
+                self.thinking_box.set(str(level))
 
     def _on_model_selected(self, _event):
         pair = self.window.model_map.get(self.model_box.get())
@@ -966,9 +1012,15 @@ class Session:
 
     def _on_thinking_selected(self, _event):
         level = self.thinking_box.get()
-        if level and level != "思考":
-            self.preferred_level = level
-            self.request("set_thinking_level", level=level)
+        if not level or level == "思考":
+            return
+        if level == "自动":
+            self.auto_thinking = True
+            self.preferred_level = None
+            return
+        self.auto_thinking = False
+        self.preferred_level = level
+        self.request("set_thinking_level", level=level)
 
     # -- frame handling -----------------------------------------------------
 
@@ -1561,6 +1613,7 @@ def detect_bridges():
 
     opencode_path = os.path.join(home, ".local", "share", "opencode", "auth.json")
     opencode = _read_json(opencode_path)
+    claimed = {}
     for provider, entry in (opencode or {}).items():
         if not isinstance(entry, dict) or entry.get("type") != "api":
             continue
@@ -1584,13 +1637,18 @@ def detect_bridges():
             continue
         if not env_name:
             continue
+        note = ""
+        if env_name in claimed:
+            note = f"与「{claimed[env_name]}」共用 {env_name}，同时导入会互相覆盖"
+        else:
+            claimed[env_name] = provider
         add({
             "id": f"opencode-{provider}",
             "source": f"OpenCode · {provider}",
             "kind": "API Key",
             "path": opencode_path,
             "detail": mask_secret(key),
-            "note": "",
+            "note": note,
         }, {env_name: key})
 
     gemini_path = os.path.join(home, ".gemini", "oauth_creds.json")
@@ -1750,8 +1808,16 @@ class BridgeDialog(tk.Toplevel):
             return
         keys = load_keys()
         imported = 0
+        seen = {}
         for item in chosen:
             for name, value in item["env"].items():
+                if name in seen and seen[name] != value:
+                    self.status.configure(
+                        text=f"{name} 只能保存一个值：{seen[name]} 与 {item['id']} 冲突，请只勾一个",
+                        fg=ERR,
+                    )
+                    return
+                seen[name] = value
                 keys[name] = value
                 imported += 1
         save_keys(keys)
