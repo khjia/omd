@@ -76,7 +76,7 @@ PROVIDERS = [
 
 VERSION_RE = re.compile(r"\b(\d+\.\d+\.\d+)\b")
 
-APP_VERSION = "1.7.8"
+APP_VERSION = "1.7.9"
 RELEASES_URL = "https://github.com/khjia/omd/releases"
 
 
@@ -102,6 +102,11 @@ def save_keys(keys):
     os.makedirs(APP_DIR, exist_ok=True)
     with open(KEY_FILE, "w", encoding="utf-8") as fh:
         json.dump(keys, fh, ensure_ascii=False, indent=1)
+    try:
+        with open(KEY_FILE, encoding="utf-8") as fh:
+            assert len(json.load(fh)) == len(keys)
+    except (OSError, ValueError, AssertionError) as exc:
+        raise RuntimeError(f"密钥写入失败：{exc}") from exc
     if os.name == "nt":
         user = os.environ.get("USERNAME") or ""
         if user:
@@ -1632,9 +1637,25 @@ class SettingsDialog(tk.Toplevel):
             value = entry.get().strip()
             if value:
                 keys[env] = value
-        save_keys(keys)
+        if not keys:
+            if not messagebox.askyesno(
+                "没有填写密钥",
+                "所有输入框都是空的。仍要保存并清空现有密钥吗？",
+                parent=self,
+            ):
+                return
+        else:
+            # empty a provider that already had a key
+            pass
+        try:
+            save_keys(keys)
+        except (OSError, RuntimeError) as exc:
+            messagebox.showerror("保存失败", str(exc), parent=self)
+            return
         self.destroy()
         self.window.apply_keys()
+        if keys:
+            self.window.active.transcript.append(f"\n已保存 {len(keys)} 个 API 密钥并重启后端\n", "meta")
 
     def clear(self):
         if not messagebox.askyesno("清空密钥", "删除本应用保存的所有 API 密钥？", parent=self):
