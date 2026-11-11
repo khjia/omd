@@ -72,7 +72,7 @@ PROVIDERS = [
 
 VERSION_RE = re.compile(r"\b(\d+\.\d+\.\d+)\b")
 
-APP_VERSION = "1.7.5"
+APP_VERSION = "1.7.6"
 RELEASES_URL = "https://github.com/khjia/omd/releases"
 
 
@@ -1529,6 +1529,62 @@ OPENCODE_ENV = {
 }
 
 
+PROVIDER_ENDPOINTS = {
+    "minimax-cn-coding-plan": (
+        "https://api.minimax.cn/anthropic",
+        "anthropic-messages",
+        ["MiniMax-M2.5", "MiniMax-M2.7", "MiniMax-M2.5-highspeed", "MiniMax-M2.7-highspeed", "MiniMax-M2"],
+    ),
+    "minimax-coding-plan": (
+        "https://api.minimax.io/anthropic",
+        "anthropic-messages",
+        ["MiniMax-M2.5", "MiniMax-M2.7", "MiniMax-M2.5-highspeed", "MiniMax-M2.7-highspeed", "MiniMax-M2"],
+    ),
+}
+
+
+def models_yml_path():
+    agent_dir = os.environ.get("OMP_AGENT_DIR") or os.path.join(os.path.expanduser("~"), ".omp", "agent")
+    return os.path.join(agent_dir, "models.yml")
+
+
+def write_custom_provider(provider, base_url, api, api_key, models):
+    """Register a provider in omp's models.yml, the way magpie does for its gateway."""
+    path = models_yml_path()
+    text = ""
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+        try:
+            with open(path + ".omd-backup", "w", encoding="utf-8") as fh:
+                fh.write(text)
+        except OSError:
+            pass
+    if f"\n  {provider}:" in text or text.startswith(f"  {provider}:"):
+        return False, "该 provider 已存在"
+    lines = [
+        f"  {provider}:",
+        f"    api: {api}",
+        f"    apiKey: {api_key}",
+        f"    baseUrl: {base_url}",
+        "    models:",
+    ]
+    for model_id in models:
+        lines.append(f"      - id: {model_id}")
+        lines.append(f"        api: {api}")
+    block = "\n".join(lines) + "\n"
+    if not text.strip():
+        text = "providers:\n"
+    if "\nproviders:" not in "\n" + text:
+        text = text.rstrip("\n") + "\nproviders:\n"
+    head, sep, tail = text.partition("providers:\n")
+    text = head + sep + block + tail
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    return True, base_url
+
+
 def _read_json(path):
     try:
         with open(path, encoding="utf-8") as fh:
@@ -1621,6 +1677,21 @@ def detect_bridges():
         provider_id = str(provider).lower()
         env_name = OPENCODE_ENV.get(provider_id)
         if not key:
+            continue
+        endpoint = PROVIDER_ENDPOINTS.get(provider_id)
+        if endpoint and env_name is None:
+            base_url, api, models = endpoint
+            found.append({
+                "id": f"opencode-{provider}-provider",
+                "source": f"OpenCode · {provider}",
+                "kind": "订阅端点",
+                "path": opencode_path,
+                "detail": mask_secret(key),
+                "note": f"将写入 models.yml 自定义 provider（{base_url}）",
+                "env": {},
+                "already": False,
+                "custom": {"provider": provider_id, "baseUrl": base_url, "api": api, "models": models, "apiKey": key},
+            })
             continue
         if not env_name and ("coding-plan" in provider_id or provider_id.endswith("-cn")):
             found.append({
@@ -1810,6 +1881,7 @@ class BridgeDialog(tk.Toplevel):
             return
         keys = load_keys()
         imported = 0
+        custom_written = []
         seen = {}
         for item in chosen:
             for name, value in item["env"].items():
@@ -1822,10 +1894,22 @@ class BridgeDialog(tk.Toplevel):
                 seen[name] = value
                 keys[name] = value
                 imported += 1
-        save_keys(keys)
+            spec = item.get("custom")
+            if spec:
+                ok, info = write_custom_provider(
+                    spec["provider"], spec["baseUrl"], spec["api"], spec["apiKey"], spec["models"]
+                )
+                if ok:
+                    custom_written.append(spec["provider"])
+        if keys or custom_written:
+            save_keys(keys)
         self.destroy()
-        self.window.apply_keys()
+        if custom_written:
+            self.window.active.transcript.append(
+                f"\n已写入 models.yml：{', '.join(custom_written)}（重启会话后出现在模型列表）\n", "meta"
+            )
         if imported:
+            self.window.apply_keys()
             self.window.active.transcript.append(f"\n已桥接 {imported} 个凭据\n", "meta")
 
 
