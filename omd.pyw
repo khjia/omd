@@ -72,7 +72,7 @@ PROVIDERS = [
 
 VERSION_RE = re.compile(r"\b(\d+\.\d+\.\d+)\b")
 
-APP_VERSION = "1.7.0"
+APP_VERSION = "1.7.1"
 RELEASES_URL = "https://github.com/khjia/omd/releases"
 
 
@@ -430,7 +430,8 @@ class SelfUpdater:
             with cls._lock:
                 cls._state = {"error": str(exc)}
             return
-        match = VERSION_RE.search(final_url.rsplit("/", 1)[-1])
+        # a tag such as "v1.7.0" has no word boundary before the digits
+        match = re.search(r"(\d+\.\d+\.\d+)", final_url.rsplit("/", 1)[-1])
         if not match:
             return
         latest = match.group(1)
