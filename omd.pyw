@@ -72,7 +72,7 @@ PROVIDERS = [
 
 VERSION_RE = re.compile(r"\b(\d+\.\d+\.\d+)\b")
 
-APP_VERSION = "1.7.4"
+APP_VERSION = "1.7.5"
 RELEASES_URL = "https://github.com/khjia/omd/releases"
 
 
@@ -1638,6 +1638,8 @@ def detect_bridges():
         if not env_name:
             continue
         note = ""
+        if provider_id in ("opencode", "opencode-go", "opencode-zen"):
+            note = "OpenCode 公共端点会拒绝该密钥（401）；桌面版能用通常是本机 magpie 网关代办，omd 已内置，无需桥接"
         if env_name in claimed:
             note = f"与「{claimed[env_name]}」共用 {env_name}，同时导入会互相覆盖"
         else:
