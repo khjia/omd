@@ -13,6 +13,8 @@ Extras:
   * OMD_LOG=<file> appends a digest of every protocol frame.
 """
 
+import base64
+import binascii
 import json
 import os
 import queue
@@ -85,7 +87,7 @@ PROVIDERS = [
 
 VERSION_RE = re.compile(r"\b(\d+\.\d+\.\d+)\b")
 
-APP_VERSION = "1.8.0"
+APP_VERSION = "1.8.1"
 RELEASES_URL = "https://github.com/khjia/omd/releases"
 
 
@@ -181,6 +183,67 @@ def flat_button(parent, text, command, fg=FG, accent=False):
         pady=4,
         cursor="hand2",
     )
+
+
+def attach_edit_menu(widget):
+    """Windows-style cut/copy/paste menu for Text and Entry widgets."""
+    menu = tk.Menu(
+        widget,
+        tearoff=0,
+        bg=SURFACE,
+        fg=FG,
+        activebackground=SURFACE_HI,
+        activeforeground=FG,
+        bd=0,
+        font=UI_FONT_SM,
+    )
+    menu.add_command(label="剪切", accelerator="Ctrl+X", command=lambda: widget.event_generate("<<Cut>>"))
+    menu.add_command(label="复制", accelerator="Ctrl+C", command=lambda: widget.event_generate("<<Copy>>"))
+    menu.add_command(label="粘贴", accelerator="Ctrl+V", command=lambda: widget.event_generate("<<Paste>>"))
+    menu.add_separator()
+    menu.add_command(label="全选", accelerator="Ctrl+A", command=lambda: _select_all(widget))
+
+    def has_selection():
+        if isinstance(widget, tk.Text):
+            return bool(widget.tag_ranges("sel"))
+        return bool(widget.selection_present())
+
+    def update_state():
+        state = "normal" if has_selection() else "disabled"
+        menu.entryconfigure("剪切", state=state)
+        menu.entryconfigure("复制", state=state)
+        try:
+            widget.clipboard_get()
+            paste_state = "normal"
+        except tk.TclError:
+            paste_state = "disabled"
+        menu.entryconfigure("粘贴", state=paste_state)
+
+    menu.configure(postcommand=update_state)
+
+    def popup(event):
+        widget.focus_set()
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+        return "break"
+
+    widget.bind("<Button-3>", popup)
+    widget.bind("<Control-a>", lambda _e: _select_all(widget))
+    widget._edit_menu = menu
+    return menu
+
+
+def _select_all(widget):
+    if isinstance(widget, tk.Text):
+        widget.tag_add("sel", "1.0", "end-1c")
+        widget.mark_set("insert", "1.0")
+    else:
+        widget.selection_range(0, "end")
+        widget.icursor("end")
+    widget.focus_set()
+    return "break"
 
 
 def pick_thinking_level(text, available):
@@ -282,6 +345,51 @@ class Updater:
         text = (proc.stdout or b"").decode("utf-8", "replace") + (proc.stderr or b"").decode("utf-8", "replace")
         return proc.returncode, text.strip()
 
+    @staticmethod
+    def _run_stream(args, timeout, on_line):
+        """Run omp and stream merged output so slow downloads show progress."""
+        exe = find_omp()
+        if not exe:
+            raise FileNotFoundError("找不到 omp 可执行文件")
+        flags = CREATE_NO_WINDOW if os.name == "nt" else 0
+        proc = subprocess.Popen(
+            [exe] + args,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            creationflags=flags,
+        )
+        timed_out = {"value": False}
+        timer = None
+        if timeout:
+            def stop():
+                timed_out["value"] = True
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+            timer = threading.Timer(timeout, stop)
+            timer.daemon = True
+            timer.start()
+        lines = []
+        try:
+            assert proc.stdout is not None
+            for raw in iter(proc.stdout.readline, b""):
+                line = raw.decode("utf-8", "replace")
+                line = re.sub(r"\x1b\[[0-9;]*m", "", line).strip()
+                if line:
+                    lines.append(line)
+                    on_line(line)
+            code = proc.wait()
+        finally:
+            if timer:
+                timer.cancel()
+            if proc.poll() is None:
+                proc.kill()
+        if timed_out["value"]:
+            raise subprocess.TimeoutExpired(cmd=[exe] + args, timeout=timeout)
+        return code, "\n".join(lines)
+
     @classmethod
     def current_version(cls):
         with cls._lock:
@@ -337,6 +445,8 @@ class Updater:
     @classmethod
     def check_now(cls):
         with cls._lock:
+            if cls._state and cls._state.get("installing"):
+                return
             cls._thread = threading.Thread(target=cls._worker, args=(True,), daemon=True)
             cls._thread.start()
 
@@ -346,7 +456,13 @@ class Updater:
             if cls._install_thread and cls._install_thread.is_alive():
                 return
             base = dict(cls._state or {})
-            base.update({"installing": True, "installed": False, "install_error": None})
+            base.update({
+                "installing": True,
+                "installed": False,
+                "install_error": None,
+                "install_line": "",
+                "install_started_at": time.time(),
+            })
             cls._state = base
             cls._install_thread = threading.Thread(target=cls._install_worker, args=(base,), daemon=True)
             cls._install_thread.start()
@@ -400,29 +516,72 @@ class Updater:
     @classmethod
     def _install_worker(cls, base):
         try:
-            code, out = cls._run(["update"], 900)
+            code, out = cls._run_stream(["update"], 3600, cls._publish_progress)
+        except subprocess.TimeoutExpired:
+            cls._publish_install(base, error="下载/安装超时（60 分钟）\n请检查网络后重试。")
+            return
         except (OSError, subprocess.SubprocessError) as exc:
             cls._publish_install(base, error=str(exc))
             return
-        if code != 0:
-            tail = out.splitlines()[-6:] if out else []
-            cls._publish_install(base, error="\n".join(tail) or f"omp update 退出码 {code}")
-            return
         with cls._lock:
             cls._current = None
-        cls._publish_install(base, installed=True)
+        current = cls.current_version()
+        latest = str(base.get("latest") or "").strip()
+        completed = "Updated to" in out or "Already up to date" in out
+        version_ok = bool(latest and current and semver(current) >= semver(latest))
+        if code != 0 and not completed and not version_ok:
+            tail = "\n".join(out.splitlines()[-8:]) or f"omp update 退出码 {code}"
+            cls._publish_install(base, error=tail[-600:] + cls._update_hint(tail))
+            return
+        if latest and current and semver(current) < semver(latest):
+            cls._publish_install(
+                base,
+                error=(f"更新命令已结束，但 omp 仍报告 {current}（期望 {latest}）\n"
+                       + "\n".join(out.splitlines()[-4:])
+                       + "\n可关闭所有 omp 窗口后重试，或从 https://omp.sh 重新安装。")[-800:],
+            )
+            return
+        cls._publish_install(base, installed=True, current=current or latest)
+
+    @staticmethod
+    def _update_hint(text):
+        lowered = (text or "").lower()
+        if any(marker in lowered for marker in (
+            "access is denied", "eperm", "eacces", "being used by another process",
+            "resource busy", "ebusy", "file is locked", "cannot access the file",
+        )):
+            return "\n提示：omp.exe 正被其他进程占用，关闭其他 omp/终端窗口后重试。"
+        if "sha256" in lowered or "integrity" in lowered or "verification" in lowered:
+            return "\n提示：下载校验失败，通常是网络问题，请重试。"
+        return ""
 
     @classmethod
-    def _publish_install(cls, base, installed=False, error=None):
+    def _publish_progress(cls, line):
+        line = (line or "").strip()
+        if not line:
+            return
+        if len(line) > 220:
+            line = line[:217] + "…"
+        with cls._lock:
+            state = dict(cls._state) if cls._state else None
+        if not state or not state.get("installing"):
+            return
+        state["install_line"] = line
+        with cls._lock:
+            cls._state = state
+
+    @classmethod
+    def _publish_install(cls, base, installed=False, error=None, current=None):
         state = dict(base)
         state.update({
             "installing": False,
             "installed": installed,
             "install_error": error,
+            "install_line": "",
             "newer": False if installed else base.get("newer", False),
         })
         if installed:
-            state["current"] = base.get("latest") or base.get("current") or ""
+            state["current"] = current or base.get("latest") or base.get("current") or ""
         cls._publish(state)
 
     @classmethod
@@ -534,20 +693,25 @@ class SelfUpdater:
 class Backend:
     """Owns one `omp --mode rpc` child process and the JSONL transport."""
 
+    MAX_CHUNK_BYTES = 64 * 1024 * 1024
+
     def __init__(self, frames, stderr_lines, on_exit):
         self.frames = frames
         self.stderr_lines = stderr_lines
         self.on_exit = on_exit
         self.proc = None
         self._lock = threading.Lock()
+        self._chunk = None
 
-    def start(self, cwd, env=None, resume=False):
+    def start(self, cwd, env=None, resume=False, session=None):
         exe = find_omp()
         if not exe:
             raise FileNotFoundError("找不到 omp 可执行文件；请确认 PATH 中有 omp。")
         flags = CREATE_NO_WINDOW if os.name == "nt" else 0
         args = [exe, "--mode", "rpc"]
-        if resume:
+        if session:
+            args.extend(["--resume", session])
+        elif resume:
             args.append("--continue")
         self.proc = subprocess.Popen(
             args,
@@ -569,11 +733,78 @@ class Backend:
             if not line:
                 continue
             try:
-                self.frames.put(json.loads(line.decode("utf-8", "replace")))
+                self._dispatch(json.loads(line.decode("utf-8", "replace")))
             except json.JSONDecodeError:
                 self.frames.put({"type": "_malformed"})
         code = proc.wait()
         self.on_exit(code)
+
+    def _dispatch(self, frame):
+        """Reassemble protocol-v2 chunks into one logical frame."""
+        if not isinstance(frame, dict):
+            self._chunk = None
+            self.frames.put({"type": "_malformed"})
+            return
+        if frame.get("type") != "rpc_chunk":
+            # an ordinary frame ends any sequence that was not completed
+            self._chunk = None
+            self.frames.put(frame)
+            return
+
+        chunk_id = frame.get("chunkId")
+        index = frame.get("index")
+        count = frame.get("count")
+        length = frame.get("byteLength")
+        data = frame.get("data")
+        valid = (
+            isinstance(chunk_id, str) and chunk_id
+            and isinstance(index, int) and isinstance(count, int)
+            and 0 <= index < count
+            and isinstance(length, int) and 0 <= length <= self.MAX_CHUNK_BYTES
+            and isinstance(data, str)
+        )
+        if not valid:
+            self._chunk = None
+            self.frames.put({"type": "_malformed"})
+            return
+
+        buf = self._chunk
+        if buf is None or buf["id"] != chunk_id:
+            if index != 0:
+                self.frames.put({"type": "_malformed"})
+                return
+            buf = {"id": chunk_id, "count": count, "length": length, "next": 0, "parts": []}
+            self._chunk = buf
+        if buf["count"] != count or buf["length"] != length or buf["next"] != index:
+            self._chunk = None
+            self.frames.put({"type": "_malformed"})
+            return
+
+        buf["parts"].append(data)
+        buf["next"] += 1
+        if buf["next"] < count:
+            return
+
+        self._chunk = None
+        try:
+            # each chunk is its own base64 string (with padding), so decode
+            # them one by one instead of concatenating the encoded text
+            raw = b"".join(base64.b64decode(part, validate=True) for part in buf["parts"])
+        except (ValueError, binascii.Error):
+            self.frames.put({"type": "_malformed"})
+            return
+        if len(raw) != length:
+            self.frames.put({"type": "_malformed"})
+            return
+        try:
+            decoded = json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            self.frames.put({"type": "_malformed"})
+            return
+        if not isinstance(decoded, dict) or decoded.get("type") == "rpc_chunk":
+            self.frames.put({"type": "_malformed"})
+            return
+        self.frames.put(decoded)
 
     def _read_stderr(self):
         proc = self.proc
@@ -817,6 +1048,8 @@ class Session:
     def __init__(self, window, cwd=None, initial_prompt=None, resume=False):
         self.window = window
         self.resume = resume
+        self._resume_path = None
+        self._resumed_had_history = False
         self.history = []
         self.history_loading = False
         self.phase = ""
@@ -844,8 +1077,11 @@ class Session:
         self.name = None                # user-given tab name
         self.auto_thinking = True       # pick effort per message unless overridden
         self._resume_retried = False
-        self.message_actions = {}
+        self.message_actions = {}       # transcript tag -> current plain text
+        self.message_roles = {}         # transcript tag -> "user" | "assistant"
+        self.bound_tags = set()
         self.undo_target_text = None
+        self.undo_text = ""
         self.prompt_history = []        # sent prompts, oldest first
         self.history_index = None
         self.history_draft = ""
@@ -908,6 +1144,21 @@ class Session:
 
         composer = tk.Frame(self.frame, bg=SURFACE, padx=12, pady=10)
         composer.pack(fill="x", side="bottom")
+
+        actions = tk.Frame(composer, bg=SURFACE)
+        actions.pack(fill="x", side="top", pady=(0, 6))
+        self.undo_btn = flat_button(actions, "撤销上轮", self.undo_last, fg=MUTED)
+        self.undo_btn.pack(side="left")
+        self.copy_btn = flat_button(actions, "复制回复", self.copy_last, fg=MUTED)
+        self.copy_btn.pack(side="left", padx=(6, 0))
+        tk.Label(
+            actions,
+            text="右键消息：复制 / 撤销到此  ·  Ctrl+Shift+C 复制回复  ·  Ctrl+Shift+Z 撤销",
+            bg=SURFACE,
+            fg=MUTED,
+            font=UI_FONT_SM,
+        ).pack(side="right")
+
         self.input = tk.Text(
             composer,
             height=3,
@@ -929,6 +1180,13 @@ class Session:
         self.input.bind("<Up>", self._on_history_up)
         self.input.bind("<Down>", self._on_history_down)
         self.input.bind("<KeyRelease>", lambda _e: self._refresh_send_button())
+        for sequence in ("<Control-Shift-C>", "<Control-Shift-c>"):
+            self.input.bind(sequence, self._shortcut_copy)
+            self.transcript.text.bind(sequence, self._shortcut_copy)
+        for sequence in ("<Control-Shift-Z>", "<Control-Shift-z>"):
+            self.input.bind(sequence, self._shortcut_undo)
+            self.transcript.text.bind(sequence, self._shortcut_undo)
+        attach_edit_menu(self.input)
 
         self.send_btn = tk.Button(
             composer,
@@ -963,9 +1221,15 @@ class Session:
     def _start_backend(self, keep_transcript=False):
         if not keep_transcript:
             self.transcript.clear()
+            self._reset_transcript_state()
             self.transcript.append("omd · 输入消息开始，或在下方选择工作目录\n", "meta")
         try:
-            self.backend.start(self.cwd, self.window.env(), resume=self.resume)
+            self.backend.start(
+                self.cwd,
+                self.window.env(),
+                resume=self.resume,
+                session=self._resume_path if self.resume else None,
+            )
         except FileNotFoundError as exc:
             self.transcript.append(f"\n{exc}\n", "error")
             self.set_status("后端未启动")
@@ -978,7 +1242,14 @@ class Session:
     def restart(self, keep_transcript=False, fresh=False):
         if fresh:
             self.resume = False
+            self._resume_path = None
             self.history = []
+        elif self.state.get("sessionFile"):
+            # Resume this exact conversation, not whichever session happens to
+            # be newest in the working directory.
+            self._resume_path = self.state["sessionFile"]
+            self.resume = True
+            self._resume_retried = False
         self.backend.stop()
         self._start_backend(keep_transcript)
 
@@ -1049,81 +1320,144 @@ class Session:
         if hasattr(self, "send_btn"):
             self.send_btn.configure(font=ui_font(size, bold=True))
 
-    def _bind_message(self, key, text):
+    def _bind_message(self, key, text, role="user"):
+        """Bind a transcript block so its context menu tracks the latest text."""
         tag = f"msg_{key}"
         if not self.transcript.tag_block(key, tag):
             return
         self.message_actions[tag] = text
+        self.message_roles[tag] = role
+        if tag in self.bound_tags:
+            return
+        self.bound_tags.add(tag)
 
-        def on_click(event, body=text):
+        def on_menu(event, t=tag):
+            body = self.message_actions.get(t) or ""
+            message_role = self.message_roles.get(t)
             menu = tk.Menu(
                 self.frame, tearoff=0, bg=SURFACE, fg=FG,
                 activebackground=SURFACE_HI, activeforeground=FG,
                 bd=0, font=UI_FONT_SM,
             )
-            menu.add_command(label="复制这条", command=lambda: self._copy_text(body))
-            menu.add_command(label="撤销到这条之前", command=lambda: self._undo_to(body))
+            if message_role == "user":
+                menu.add_command(label="复制这条", command=lambda: self._copy_text(body, "消息"))
+                menu.add_separator()
+                menu.add_command(label="撤销到这条之前", command=lambda: self._undo_to(body))
+            else:
+                menu.add_command(label="复制这条回复", command=lambda: self._copy_text(body, "回复"))
             try:
                 menu.tk_popup(event.x_root, event.y_root)
             finally:
                 menu.grab_release()
             return "break"
 
-        self.transcript.text.tag_bind(tag, "<Button-1>", on_click)
-        self.transcript.text.tag_bind(tag, "<Enter>", lambda _e: self.transcript.text.configure(cursor="hand2"))
-        self.transcript.text.tag_bind(tag, "<Leave>", lambda _e: self.transcript.text.configure(cursor="arrow"))
+        events = ("<Button-3>", "<Control-Button-1>")
+        for event in events:
+            self.transcript.text.tag_bind(tag, event, on_menu)
 
-    def _copy_text(self, text):
+    def _copy_text(self, text, label="内容"):
+        text = text or ""
+        if not text.strip():
+            self.set_status("没有可复制的内容")
+            return
         self.frame.clipboard_clear()
         self.frame.clipboard_append(text)
-        self.transcript.append(f"\n已复制（{len(text)} 字）\n", "meta")
+        self.set_status(f"已复制{label}（{len(text)} 字）")
+
+    def _last_reply_text(self):
+        for msg in reversed(list(self.last_msgs.values())):
+            content = msg.get("content") or []
+            if isinstance(content, str):
+                content = [{"type": "text", "text": content}]
+            body = "".join(
+                (block.get("text") or "")
+                for block in content
+                if isinstance(block, dict) and block.get("type") == "text"
+            ).strip()
+            if body:
+                return body
+        return ""
+
+    def _shortcut_copy(self, _event):
+        self.copy_last()
+        return "break"
+
+    def _shortcut_undo(self, _event):
+        self.undo_last()
+        return "break"
 
     def _undo_to(self, text):
         if self.busy:
-            self.transcript.append("\n正在运行，先停止再撤销\n", "meta")
+            self.set_status("正在运行，先停止再撤销")
             return
         self.undo_target_text = text
         self.request("get_entries")
 
     def copy_last(self):
-        if not self.prompt_history:
-            self.transcript.append("\n还没有已发送的任务\n", "meta")
+        text = self._last_reply_text()
+        if not text:
+            self.set_status("还没有可复制的回复")
             return
-        text = self.prompt_history[-1]
-        self.frame.clipboard_clear()
-        self.frame.clipboard_append(text)
-        self.transcript.append(f"\n已复制最后一条任务（{len(text)} 字）\n", "meta")
+        self._copy_text(text, "最后一条回复")
 
     def undo_last(self):
-        if not self.prompt_history:
-            self.transcript.append("\n没有可撤销的任务\n", "meta")
+        if self.busy:
+            self.set_status("正在运行，先停止再撤销")
             return
-        self._undo_to(self.prompt_history[-1])
-
-    def _finish_undo(self, entries):
-        wanted = getattr(self, "undo_target_text", None)
         self.undo_target_text = None
-        last_user = None
-        matched = None
-        for entry in entries or []:
+        self.request("get_entries")
+
+    def _finish_undo(self, data):
+        wanted = (self.undo_target_text or "").strip() or None
+        self.undo_target_text = None
+        if isinstance(data, dict):
+            entries = data.get("entries") or []
+            leaf = data.get("leafId")
+        else:
+            entries, leaf = data or [], None
+        by_id = {}
+        for entry in entries:
+            entry_id = entry.get("id")
+            if entry_id:
+                by_id[entry_id] = entry
+        # get_entries returns the whole tree; only the leaf's ancestor chain is
+        # the live conversation, so an undone turn is not picked again.
+        branch = []
+        if leaf:
+            cursor, seen = leaf, set()
+            while cursor and cursor in by_id and cursor not in seen:
+                seen.add(cursor)
+                entry = by_id[cursor]
+                branch.append(entry)
+                cursor = entry.get("parentId")
+            branch.reverse()
+        else:
+            branch = list(entries)
+        if not branch and entries:
+            branch = list(entries)
+        users = []
+        for entry in branch:
             message = entry.get("message") or {}
             if entry.get("type") != "message" or message.get("role") != "user":
                 continue
-            if message.get("attribution") == "agent":
+            if message.get("attribution") in ("agent", "internal"):
                 continue
             body = text_parts(message.get("content")).strip()
-            if not body:
-                continue
-            last_user = entry.get("id")
-            if wanted is not None and body == wanted.strip():
-                matched = entry.get("id")
-        target = matched or (last_user if wanted is None else None)
+            if body:
+                users.append((entry.get("id"), body))
+        target = None
+        undo_text = wanted or ""
+        if wanted is None:
+            if users:
+                target, undo_text = users[-1]
+        else:
+            for entry_id, body in users:
+                if body == wanted:
+                    target = entry_id
         if not target:
-            self.transcript.append("\n找不到可撤销的消息\n", "meta")
+            self.set_status("找不到可撤销的消息")
             return
-        self.undo_text = wanted or (self.prompt_history[-1] if self.prompt_history else "")
-        if self.prompt_history and self.prompt_history[-1] == self.undo_text:
-            self.prompt_history.pop()
+        self.undo_text = undo_text
         self.request("navigate_tree", entryId=target)
 
     def send(self):
@@ -1180,6 +1514,7 @@ class Session:
         labels = list(self.window.model_map)
         if labels:
             self.model_box.configure(values=labels)
+        self._maybe_default_model()
         label = self.window._label_for(self)
         if label:
             self.model_box.set(label)
@@ -1194,6 +1529,32 @@ class Session:
             level = self.preferred_level or self.state.get("thinkingLevel")
             if level:
                 self.thinking_box.set(str(level))
+
+    def _maybe_default_model(self):
+        """Default to OpenCode Go's DeepSeek V4.1 Flash on a fresh conversation."""
+        if self.preferred_pair or not self.window.default_pair:
+            return False
+        if not self._opencode_go_ready():
+            return False
+        if self.resume or self.history_loading or self._resumed_had_history:
+            return False
+        pair = self.window.default_pair
+        self.preferred_pair = pair
+        self.request("set_model", provider=pair[0], modelId=pair[1])
+        return True
+
+    def _opencode_go_ready(self):
+        if self.window.env().get("OPENCODE_API_KEY"):
+            return True
+        pair = self.current_pair
+        if not pair:
+            model = self.state.get("model") if isinstance(self.state, dict) else None
+            if isinstance(model, dict):
+                pair = (model.get("provider") or "", model.get("id") or "")
+        if pair:
+            provider, mid = pair
+            return "opencode-go" in str(provider) or str(mid).startswith("opencode-go/")
+        return False
 
     def _on_model_selected(self, _event):
         pair = self.window.model_map.get(self.model_box.get())
@@ -1262,6 +1623,10 @@ class Session:
         t = f.get("type")
 
         if t == "ready":
+            if 2 in (f.get("supportedProtocolVersions") or []):
+                # v2 turns oversized responses (long get_entries pages) into
+                # rpc_chunk frames, which Backend reassembles.
+                self.request("negotiate_protocol", protocolVersion=2)
             self.set_status("就绪")
             self.request("get_available_models")
             self.request("get_available_thinking_levels")
@@ -1388,8 +1753,7 @@ class Session:
         data = f.get("data")
 
         if cmd == "get_entries" and ok:
-            entries = data.get("entries") if isinstance(data, dict) else data
-            self._finish_undo(entries or [])
+            self._finish_undo(data)
             return
 
         if cmd == "navigate_tree":
@@ -1399,11 +1763,19 @@ class Session:
                 self.resume = True
                 self.history_loading = True
                 self.request("get_messages_page", limit=100)
-                if getattr(self, "undo_text", None):
-                    self._set_input(self.undo_text)
-                    self.undo_text = None
-                self.pending_note = "\n已撤销上一条任务，文本已放回输入框\n"
-            self.undo_pending = False
+                text = ""
+                if isinstance(data, dict):
+                    text = str(data.get("editorText") or "")
+                if not text:
+                    text = self.undo_text or ""
+                if text:
+                    self._set_input(text)
+                self.undo_text = ""
+                self.pending_note = "\n已撤销所选消息及其后的对话，文本已放回输入框\n"
+            else:
+                self.undo_text = ""
+                self.pending_note = None
+                self.set_status("撤销失败，会话未改动")
             self.request("get_state")
             return
 
@@ -1421,7 +1793,7 @@ class Session:
                 self.set_status("就绪")
             return
 
-        if not ok and cmd not in ("abort",):
+        if not ok and cmd not in ("abort", "negotiate_protocol"):
             self.transcript.append(f"\n{cmd} 失败：{f.get('error')}\n", "error")
             return
 
@@ -1454,6 +1826,7 @@ class Session:
 
         if cmd == "new_session" and ok:
             self.transcript.clear()
+            self._reset_transcript_state()
             self.set_busy(False)
             self.set_status("新会话")
             self.request("get_state")
@@ -1563,9 +1936,22 @@ class Session:
             self.request("set_session_name", name=name)
         self.window._style_chips()
 
+    def _reset_transcript_state(self):
+        """Transcript was cleared: drop views that point at removed blocks."""
+        self.dirty.clear()
+        self.last_msgs.clear()
+        self.msg_starts.clear()
+        self.message_actions.clear()
+        self.message_roles.clear()
+        self.bound_tags.clear()
+        self.undo_target_text = None
+        self.undo_text = ""
+
     def _finish_history(self):
+        had_history = bool(self.history)
         self.resume = False
         self.history_loading = False
+        self._resumed_had_history = had_history
         self._render_history(self.history)
         self.history = []
         self.set_status("就绪")
@@ -1579,6 +1965,7 @@ class Session:
         self.prompt_history = []
         self.history_index = None
         self.transcript.clear()
+        self._reset_transcript_state()
         if not messages:
             self.transcript.append("omd · 新会话，输入消息开始\n", "meta")
             return
@@ -1605,6 +1992,9 @@ class Session:
                 self.msg_starts.add("a" + key)
                 self.transcript.add_block(key, "omd", "name_assistant")
                 self.transcript.set_block(key, segments)
+                reply = text_parts(message.get("content")).strip()
+                if reply:
+                    self._bind_message(key, reply, "assistant")
             elif role == "tool":
                 body = first_lines(text_parts(message.get("content")))
                 name = message.get("toolName") or "tool"
@@ -1720,6 +2110,7 @@ class Session:
     def _render_assistant(self, key, msg):
         self.last_msgs[key] = msg
         segments = []
+        bodies = []
         content = msg.get("content") or []
         if isinstance(content, str):
             content = [{"type": "text", "text": content}]
@@ -1728,13 +2119,18 @@ class Session:
                 continue
             btype = block.get("type")
             if btype == "text":
-                segments.append((block.get("text") or "", "body"))
+                text = block.get("text") or ""
+                segments.append((text, "body"))
+                bodies.append(text)
             elif btype == "thinking":
                 if self.window.show_thinking.get():
                     segments.append((block.get("thinking") or "", "thinking"))
             elif btype == "toolCall":
                 continue  # rendered from tool_execution_start/end
         self.transcript.set_block(key, segments)
+        body = "".join(bodies).strip()
+        if body:
+            self._bind_message(key, body, "assistant")
 
 
 
@@ -1817,6 +2213,7 @@ class SettingsDialog(tk.Toplevel):
                 highlightcolor=ACCENT,
             )
             entry.pack(side="left", fill="x", expand=True, padx=(0, 8), ipady=3)
+            attach_edit_menu(entry)
             value = saved.get(env, "")
             if value:
                 entry.insert(0, value)
@@ -1904,6 +2301,7 @@ class Window:
         self.sessions = []
         self.active = None
         self.model_map = {}
+        self.default_pair = None
         self.show_thinking = tk.BooleanVar(value=True)
         try:
             self.font_size = max(FONT_MIN, min(FONT_MAX, int(load_pref("font_size", DEFAULT_FONT_SIZE))))
@@ -2195,8 +2593,21 @@ class Window:
             label = f"{name}  ·  {provider}"
             labels.append(label)
             self.model_map[label] = (provider, mid)
+        self.default_pair = self._pick_default_model()
         for session in self.sessions:
             session.apply_catalog()
+
+    def _pick_default_model(self):
+        """Prefer DeepSeek V4.1 Flash when OpenCode Go models are available."""
+        preferred = (
+            ("magpie", "opencode-go/deepseek-v4.1-flash"),
+            ("opencode-go", "deepseek-v4.1-flash"),
+        )
+        available = set(self.model_map.values())
+        for pair in preferred:
+            if pair in available:
+                return pair
+        return None
 
     def set_thinking_levels(self, levels):
         if levels:
@@ -2263,6 +2674,7 @@ class Window:
             highlightcolor=ACCENT,
         )
         entry.pack(side="left", fill="x", padx=(0, 2), before=chip.close_widget)
+        attach_edit_menu(entry)
         entry.insert(0, original)
         entry.select_range(0, "end")
         entry.after(30, entry.focus_set)
@@ -2339,8 +2751,11 @@ class Window:
 
     def _restart_active(self):
         self._hide_banner()
-        if self.active:
-            self.active.restart()
+        if any(session.busy for session in self.sessions):
+            self._show_banner("有任务正在运行，等它结束后再重启", [("关闭", self._hide_banner)])
+            return
+        for session in list(self.sessions):
+            session.restart(keep_transcript=True)
 
     def _sync_update_banner(self):
         own = SelfUpdater.snapshot()
@@ -2355,6 +2770,11 @@ class Window:
             return
 
         state = Updater.snapshot()
+        if state and state.get("installing"):
+            # refresh the elapsed timer even when the downloader is silent
+            state = dict(state)
+            started = state.get("install_started_at") or time.time()
+            state["install_tick"] = int(time.time() - started)
         if state is None or state == self._last_update_state:
             return
         self._last_update_state = state
@@ -2364,11 +2784,21 @@ class Window:
             self.version_label.configure(text=f" omp {current}")
 
         if state.get("installing"):
-            self._show_banner(f"正在更新 omp（当前 {current or '?'}）…", [])
+            started = state.get("install_started_at") or 0
+            elapsed = f" {int(time.time() - started)}s" if started else ""
+            text = f"正在更新 omp（当前 {current or '?'}）…{elapsed}"
+            line = str(state.get("install_line") or "")
+            if line:
+                text += f"\n{line}"
+            self._show_banner(text, [])
             return
         if state.get("install_error"):
+            err = str(state["install_error"])
+            hint = Updater._update_hint(err)
+            if hint and hint.strip() not in err:
+                err += hint
             self._show_banner(
-                "更新失败：" + str(state["install_error"]),
+                "更新失败：" + err[-800:],
                 [("重试", self._install_update), ("关闭", self._hide_banner)],
                 error=True,
             )
@@ -2378,7 +2808,7 @@ class Window:
             self.version_label.configure(text=f" omp {latest}")
             self._show_banner(
                 f"已更新到 {latest}，重启会话后生效",
-                [("重启会话", self._restart_active), ("关闭", self._hide_banner)],
+                [("重启全部会话", self._restart_active), ("关闭", self._hide_banner)],
             )
             return
         if state.get("newer") and state.get("latest") != Updater.dismissed_version():
