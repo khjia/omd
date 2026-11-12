@@ -32,17 +32,79 @@ from tkinter import filedialog, messagebox, ttk
 
 # ---------------------------------------------------------------- palette ---
 
-BG = "#1b1b20"
-SURFACE = "#232329"
-SURFACE_HI = "#2c2c34"
-FG = "#e6e6ea"
-MUTED = "#8f8f9b"
-ACCENT = "#7aa2f7"
-USER = "#9ece6a"
-OK = "#7dc97d"
-WARN = "#e0af68"
-ERR = "#e06c75"
-BORDER = "#33333c"
+THEMES = {
+    "opencode": {
+        "label": "OpenCode 深色",
+        "BG": "#212121",
+        "SURFACE": "#252525",
+        "SURFACE_HI": "#303030",
+        "FG": "#e0e0e0",
+        "MUTED": "#8a8a8a",
+        "ACCENT": "#fab283",
+        "USER": "#7fd88f",
+        "OK": "#7fd88f",
+        "WARN": "#f5a742",
+        "ERR": "#e06c75",
+        "BORDER": "#4b4c5c",
+    },
+    "opencode-light": {
+        "label": "OpenCode 浅色",
+        "BG": "#f8f8f8",
+        "SURFACE": "#f0f0f0",
+        "SURFACE_HI": "#e5e5e6",
+        "FG": "#2a2a2a",
+        "MUTED": "#6f6f6f",
+        "ACCENT": "#3b7dd8",
+        "USER": "#3d9a57",
+        "OK": "#3d9a57",
+        "WARN": "#d68c27",
+        "ERR": "#d1383d",
+        "BORDER": "#d3d3d3",
+    },
+    "midnight": {
+        "label": "午夜蓝",
+        "BG": "#1b1b20",
+        "SURFACE": "#232329",
+        "SURFACE_HI": "#2c2c34",
+        "FG": "#e6e6ea",
+        "MUTED": "#8f8f9b",
+        "ACCENT": "#7aa2f7",
+        "USER": "#9ece6a",
+        "OK": "#7dc97d",
+        "WARN": "#e0af68",
+        "ERR": "#e06c75",
+        "BORDER": "#33333c",
+    },
+    "forest": {
+        "label": "森林",
+        "BG": "#121713",
+        "SURFACE": "#18201a",
+        "SURFACE_HI": "#202b22",
+        "FG": "#e2e8e3",
+        "MUTED": "#8a9a8e",
+        "ACCENT": "#7fd88f",
+        "USER": "#e5c07b",
+        "OK": "#7fd88f",
+        "WARN": "#f5a742",
+        "ERR": "#e06c75",
+        "BORDER": "#2e3b31",
+    },
+}
+
+CURRENT_THEME = "opencode"
+
+
+def apply_theme(name):
+    """Swap the module-level palette before the UI is built."""
+    global CURRENT_THEME
+    key = name if name in THEMES else "opencode"
+    CURRENT_THEME = key
+    for color, value in THEMES[key].items():
+        if color != "label":
+            globals()[color] = value
+
+
+apply_theme("opencode")
 
 UI_FONT = ("Microsoft YaHei UI", 10)
 UI_FONT_SM = ("Microsoft YaHei UI", 9)
@@ -50,6 +112,8 @@ MONO_FONT = ("Cascadia Mono", 9)
 
 DEFAULT_FONT_SIZE = 11
 FONT_MIN, FONT_MAX = 9, 20
+
+THINKING_VIEWS = ("详细", "简约", "隐藏")
 
 
 def ui_font(size, bold=False, italic=False, mono=False):
@@ -1115,20 +1179,16 @@ class Session:
         self.thinking_box.bind("<<ComboboxSelected>>", self._on_thinking_selected)
         self.thinking_box.set("思考")
 
-        tk.Checkbutton(
+        tk.Label(tools_pane, text="思考显示", bg=SURFACE, fg=MUTED, font=UI_FONT_SM).pack(side="left")
+        self.view_box = ttk.Combobox(
             tools_pane,
-            text="显示思考",
-            variable=self.window.show_thinking,
-            command=self.redraw,
-            bg=SURFACE,
-            fg=MUTED,
-            activebackground=SURFACE,
-            activeforeground=FG,
-            selectcolor=FG,
-            font=UI_FONT_SM,
-            borderwidth=0,
-            highlightthickness=0,
-        ).pack(side="left")
+            width=5,
+            state="readonly",
+            values=list(THINKING_VIEWS),
+            textvariable=self.window.thinking_view,
+        )
+        self.view_box.pack(side="left", padx=(4, 10))
+        self.view_box.bind("<<ComboboxSelected>>", self._on_thinking_view_selected)
 
 
         self.reset_btn = flat_button(tools_pane, "重置会话", self.new_session)
@@ -1576,6 +1636,9 @@ class Session:
         self.preferred_level = level
         self.request("set_thinking_level", level=level)
 
+    def _on_thinking_view_selected(self, _event):
+        self.window.set_thinking_view(self.view_box.get())
+
     # -- frame handling -----------------------------------------------------
 
     def _log(self, frame):
@@ -2004,20 +2067,54 @@ class Session:
         self.transcript.text.see("end")
 
     def _segments_for(self, message):
-        segments = []
-        content = message.get("content") or []
+        segments, _ = self._content_segments(message.get("content") or [])
+        return segments
+
+    def _content_segments(self, content):
         if isinstance(content, str):
             content = [{"type": "text", "text": content}]
+        mode = self.window.thinking_view.get()
+        segments = []
+        bodies = []
+        thinking_texts = []
+        summary_index = None
         for block in content:
             if not isinstance(block, dict):
                 continue
             btype = block.get("type")
             if btype == "text":
-                segments.append((block.get("text") or "", "body"))
+                text = block.get("text") or ""
+                segments.append((text, "body"))
+                bodies.append(text)
             elif btype == "thinking":
-                if self.window.show_thinking.get():
-                    segments.append((block.get("thinking") or "", "thinking"))
-        return segments
+                text = block.get("thinking") or ""
+                if mode == "隐藏":
+                    continue
+                if mode == "简约":
+                    thinking_texts.append(text)
+                    if summary_index is None:
+                        summary_index = len(segments)
+                        segments.append(("", "thinking"))
+                else:
+                    segments.append((text, "thinking"))
+            elif btype == "toolCall":
+                continue
+        if summary_index is not None:
+            summary = self._thinking_summary(thinking_texts)
+            if summary:
+                segments[summary_index] = (summary, "thinking")
+            else:
+                del segments[summary_index]
+        return segments, bodies
+
+    def _thinking_summary(self, texts):
+        body = "\n".join(text for text in texts if text and text.strip()).strip()
+        if not body:
+            return ""
+        first = next((line.strip() for line in body.splitlines() if line.strip()), "")
+        if len(first) > 90:
+            first = first[:87] + "…"
+        return f"思考 {len(body)} 字 · {first}"
 
     # -- message rendering --------------------------------------------------
 
@@ -2109,24 +2206,7 @@ class Session:
 
     def _render_assistant(self, key, msg):
         self.last_msgs[key] = msg
-        segments = []
-        bodies = []
-        content = msg.get("content") or []
-        if isinstance(content, str):
-            content = [{"type": "text", "text": content}]
-        for block in content:
-            if not isinstance(block, dict):
-                continue
-            btype = block.get("type")
-            if btype == "text":
-                text = block.get("text") or ""
-                segments.append((text, "body"))
-                bodies.append(text)
-            elif btype == "thinking":
-                if self.window.show_thinking.get():
-                    segments.append((block.get("thinking") or "", "thinking"))
-            elif btype == "toolCall":
-                continue  # rendered from tool_execution_start/end
+        segments, bodies = self._content_segments(msg.get("content") or [])
         self.transcript.set_block(key, segments)
         body = "".join(bodies).strip()
         if body:
@@ -2180,6 +2260,22 @@ class SettingsDialog(tk.Toplevel):
             font=UI_FONT_SM,
             justify="left",
         ).pack(anchor="w", pady=(4, 0))
+
+        theme_row = tk.Frame(head, bg=BG)
+        theme_row.pack(fill="x", pady=(10, 0))
+        tk.Label(theme_row, text="主题", bg=BG, fg=FG, font=UI_FONT_SM).pack(side="left")
+        self.theme_box = ttk.Combobox(
+            theme_row,
+            width=18,
+            state="readonly",
+            values=[theme["label"] for theme in THEMES.values()],
+        )
+        current = THEMES.get(CURRENT_THEME, THEMES["opencode"])
+        self.theme_box.set(current["label"])
+        self.theme_box.pack(side="left", padx=(8, 8))
+        self.theme_btn = flat_button(theme_row, "应用主题", self.apply_theme_choice, fg=MUTED)
+        self.theme_btn.pack(side="left")
+        tk.Label(theme_row, text="重启后生效", bg=BG, fg=MUTED, font=UI_FONT_SM).pack(side="left", padx=(8, 0))
 
         body = tk.Frame(self, bg=BG)
         body.pack(fill="both", expand=True, padx=18, pady=(4, 0))
@@ -2254,6 +2350,21 @@ class SettingsDialog(tk.Toplevel):
         for entry in self.entries.values():
             entry.configure(show=show)
 
+    def apply_theme_choice(self):
+        label = self.theme_box.get()
+        key = next((name for name, theme in THEMES.items() if theme["label"] == label), CURRENT_THEME)
+        if key == CURRENT_THEME:
+            messagebox.showinfo("主题", "当前已经是这个主题。", parent=self)
+            return
+        save_pref("theme", key)
+        if messagebox.askyesno(
+            "切换主题",
+            f"已选择「{label}」，重启 omd 后生效。\n现在重启吗？",
+            parent=self,
+        ):
+            self.destroy()
+            self.window.restart_app()
+
     def save(self):
         keys = {}
         for env, entry in self.entries.items():
@@ -2302,7 +2413,10 @@ class Window:
         self.active = None
         self.model_map = {}
         self.default_pair = None
-        self.show_thinking = tk.BooleanVar(value=True)
+        view = load_pref("thinking_view", "详细")
+        if view not in THINKING_VIEWS:
+            view = "详细"
+        self.thinking_view = tk.StringVar(value=view)
         try:
             self.font_size = max(FONT_MIN, min(FONT_MAX, int(load_pref("font_size", DEFAULT_FONT_SIZE))))
         except (TypeError, ValueError):
@@ -2377,25 +2491,27 @@ class Window:
         win.option_add("*TCombobox*Listbox.selectForeground", "#12131a")
         win.option_add("*TCombobox*Listbox.font", UI_FONT)
 
-        header = tk.Frame(win, bg=SURFACE, pady=8)
-        header.pack(fill="x", side="top")
+        # -- brand, window controls and session tabs share one row --
+        topbar = tk.Frame(win, bg=BG, pady=4)
+        topbar.pack(fill="x", side="top")
 
-        tk.Label(header, text="omd", bg=SURFACE, fg=ACCENT, font=(UI_FONT[0], 13, "bold")).pack(
-            side="left", padx=(16, 10)
+        tk.Label(topbar, text="omd", bg=BG, fg=ACCENT, font=(UI_FONT[0], 13, "bold")).pack(
+            side="left", padx=(14, 10)
         )
 
-        self.font_minus = flat_button(header, "A−", lambda: self.change_font(-1), fg=MUTED)
-        self.font_minus.pack(side="right", padx=(6, 0))
-        self.font_plus = flat_button(header, "A+", lambda: self.change_font(1), fg=MUTED)
-        self.font_plus.pack(side="right", padx=(6, 4))
-        self.update_btn = flat_button(header, "更新", Updater.check_now, fg=MUTED)
-        self.update_btn.pack(side="right", padx=(6, 14))
-        self.settings_btn = flat_button(header, "设置", self.open_settings, fg=MUTED)
-        self.settings_btn.pack(side="right", padx=6)
+        controls = tk.Frame(topbar, bg=BG)
+        controls.pack(side="right", padx=(6, 8))
+        self.settings_btn = flat_button(controls, "设置", self.open_settings, fg=MUTED)
+        self.settings_btn.pack(side="left", padx=4)
+        self.update_btn = flat_button(controls, "更新", Updater.check_now, fg=MUTED)
+        self.update_btn.pack(side="left", padx=4)
+        self.font_plus = flat_button(controls, "A+", lambda: self.change_font(1), fg=MUTED)
+        self.font_plus.pack(side="left", padx=4)
+        self.font_minus = flat_button(controls, "A−", lambda: self.change_font(-1), fg=MUTED)
+        self.font_minus.pack(side="left", padx=4)
 
-        # -- session tabs --
-        self.tabs = tk.Frame(win, bg=BG, pady=6)
-        self.tabs.pack(fill="x", side="top")
+        self.tabs = tk.Frame(topbar, bg=BG)
+        self.tabs.pack(side="left", fill="x", expand=True)
         self.tab_chips = {}
 
         # -- update banner --
@@ -2573,8 +2689,29 @@ class Window:
             session.apply_font(self.font_size)
         save_pref("font_size", self.font_size)
 
+    def set_thinking_view(self, value):
+        if value not in THINKING_VIEWS:
+            value = "详细"
+        self.thinking_view.set(value)
+        save_pref("thinking_view", value)
+        for session in self.sessions:
+            session.redraw()
+
     def open_settings(self):
         SettingsDialog(self)
+
+    def restart_app(self):
+        """Relaunch omd so a saved theme (or other startup pref) takes effect."""
+        try:
+            if getattr(sys, "frozen", False):
+                cmd = [sys.executable] + sys.argv[1:]
+            else:
+                cmd = [sys.executable, os.path.abspath(sys.argv[0])] + sys.argv[1:]
+            subprocess.Popen(cmd, creationflags=CREATE_NO_WINDOW if os.name == "nt" else 0)
+        except OSError as exc:
+            messagebox.showerror("重启失败", f"无法启动新进程：{exc}\n请手动重新打开 omd。", parent=self.root)
+            return
+        self.close()
 
 
     # -- shared model catalog ----------------------------------------------
@@ -2843,6 +2980,7 @@ def main():
     for i, arg in enumerate(args):
         if arg in ("--prompt", "-p") and i + 1 < len(args):
             initial = args[i + 1]
+    apply_theme(load_pref("theme", "opencode"))
     root = tk.Tk()
     try:
         root.tk.call("tk", "scaling", 1.35)
